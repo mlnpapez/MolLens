@@ -368,11 +368,11 @@ def main():
     
     # Train GPT
     print("\n=== Training GPT model ===")
-    model = train_gpt(model, dataloader, epochs=2, device=device)
+    model = train_gpt(model, dataloader, epochs=20, device=device)
     
     # Collect activations
     print("\n=== Collecting Activations ===")
-    activations = collect_activations(model, dataloader, layer_idx=0, max_batches=50, device=device)
+    activations = collect_activations(model, dataloader, layer_idx=0, max_batches=500000, device=device)
     
     # Train SAE
     print("\n=== Training SAE ===")
@@ -383,7 +383,7 @@ def main():
         d_sae=d_in*4, 
         l1_coeff=1e-3,
         lr=3e-4,
-        steps=3000,
+        steps=100000,
         device=device
     )
 
