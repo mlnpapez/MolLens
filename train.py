@@ -6,6 +6,9 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 import re
 from typing import List
+from sae_lens import SAE
+from transformer_lens import HookedTransformer
+import matplotlib.pyplot as plt
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -128,9 +131,9 @@ def collect_activations(model, dataloader, layer_idx=0, max_batches=50, device="
 
 
 # -----------------------------
-# 4) Train SAE with sae_lens
+# 4) Train SAE - Correct sae_lens imports
 # -----------------------------
-from sae_lens import SAE
+
 
 def train_sae_simple(activations, d_in, d_sae=None, l1_coeff=1e-3, 
                      lr=3e-4, steps=3000, batch_size=1024, device="cuda"):
@@ -138,7 +141,7 @@ def train_sae_simple(activations, d_in, d_sae=None, l1_coeff=1e-3,
     if d_sae is None:
         d_sae = d_in * 4
     
-    # Initialize SAE using from_dict
+    # Initialize SAE using from_dict (correct API)
     sae = SAE.from_dict({
         "d_in": d_in,
         "d_sae": d_sae,
@@ -152,15 +155,14 @@ def train_sae_simple(activations, d_in, d_sae=None, l1_coeff=1e-3,
     losses = []
     
     for step in tqdm(range(steps), desc="Training SAE"):
-        # Sample random batch
         indices = torch.randint(0, activations.shape[0], (batch_size,))
         batch = activations[indices].to(device)
         
-        # Forward pass using encode/decode
+        # Use encode/decode methods
         feature_acts = sae.encode(batch)
         reconstruction = sae.decode(feature_acts)
         
-        # Loss: reconstruction + L1 sparsity
+        # Loss calculation
         recon_loss = (reconstruction - batch).pow(2).mean()
         l1_loss = l1_coeff * feature_acts.abs().sum(dim=-1).mean()
         loss = recon_loss + l1_loss
@@ -178,7 +180,107 @@ def train_sae_simple(activations, d_in, d_sae=None, l1_coeff=1e-3,
 
 
 # -----------------------------
-# 5) Analysis
+# 5) Wrap model for sae_dashboard compatibility
+# -----------------------------
+
+
+def wrap_gpt2_for_dashboard(gpt2_model, tokenizer):
+    """
+    Wrap HuggingFace GPT2 model to work with transformer_lens.
+    This allows compatibility with sae_dashboard.
+    """
+    # Create HookedTransformer from pretrained
+    hooked_model = HookedTransformer.from_pretrained(
+        "gpt2-small",
+        device=str(gpt2_model.device)
+    )
+    
+    # Copy weights from our trained model
+    hooked_model.load_state_dict(gpt2_model.state_dict(), strict=False)
+    
+    return hooked_model
+
+
+# -----------------------------
+# 6) Create tokens dataset for dashboard
+# -----------------------------
+def create_token_dataset(smiles_list, tokenizer, max_samples=100):
+    """Create a token dataset for sae_dashboard."""
+    tokens_list = []
+    
+    for smiles in smiles_list[:max_samples]:
+        token_ids = tokenizer.encode(smiles)
+        tokens_list.append(torch.tensor(token_ids))
+    
+    # Pad to same length
+    max_len = max(len(t) for t in tokens_list)
+    padded_tokens = []
+    for t in tokens_list:
+        if len(t) < max_len:
+            padded = torch.cat([t, torch.full((max_len - len(t),), tokenizer.pad_token_id)])
+        else:
+            padded = t
+        padded_tokens.append(padded)
+    
+    return torch.stack(padded_tokens)
+
+
+# -----------------------------
+# 7) Generate SAE Dashboard Visualization
+# -----------------------------
+def generate_sae_dashboard(sae, model, tokens, output_dir="sae_analysis"):
+    """
+    Generate interactive SAE dashboard using sae_dashboard.
+    """
+    try:
+        from sae_dashboard.sae_vis_data import SaeVisConfig
+        from sae_dashboard.sae_vis_runner import SaeVisRunner
+        from sae_dashboard.data_writing_fns import save_feature_centric_vis
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print("\n=== Generating SAE Dashboard ===")
+        
+        # Configure visualization
+        config = SaeVisConfig(
+            hook_point=sae.cfg.hook_name if hasattr(sae.cfg, 'hook_name') else "blocks.0.hook_resid_post",
+            features=list(range(min(50, sae.cfg.d_sae))),  # Visualize first 50 features
+            minibatch_size_features=32,
+            minibatch_size_tokens=128,
+            device=str(model.device),
+            verbose=True,
+        )
+        
+        # Generate visualization data
+        print("Running SaeVisRunner...")
+        runner = SaeVisRunner(config)
+        vis_data = runner.run(
+            encoder=sae,
+            model=model,
+            tokens=tokens
+        )
+        
+        # Save interactive HTML dashboard
+        dashboard_path = os.path.join(output_dir, "feature_dashboard.html")
+        save_feature_centric_vis(
+            sae_vis_data=vis_data,
+            filename=dashboard_path
+        )
+        
+        print(f"\n✓ Interactive dashboard saved to: {dashboard_path}")
+        print(f"  Open this file in a web browser to explore features!")
+        
+        return vis_data
+        
+    except ImportError as e:
+        print(f"\n⚠ sae_dashboard not installed: {e}")
+        print("Install with: pip install sae-dashboard")
+        print("Falling back to matplotlib visualizations...")
+        return None
+
+
+# -----------------------------
+# 8) Analysis
 # -----------------------------
 def analyze_sae_features(model, sae, tokenizer, test_smiles_list, device="cuda"):
     """Analyze SAE features on test SMILES."""
@@ -191,11 +293,9 @@ def analyze_sae_features(model, sae, tokenizer, test_smiles_list, device="cuda")
             token_ids = tokenizer.encode(smiles)
             input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
             
-            # Get model activations
             outputs = model(input_ids, output_hidden_states=True)
             hidden = outputs.hidden_states[1]  # Layer 0
             
-            # SAE encode/decode
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
             feature_acts = sae.encode(hidden_flat)
             reconstruction = sae.decode(feature_acts)
@@ -215,16 +315,15 @@ def analyze_sae_features(model, sae, tokenizer, test_smiles_list, device="cuda")
 
 
 # -----------------------------
-# 6) Visualizations
+# 9) Fallback Matplotlib Visualizations
 # -----------------------------
-import matplotlib.pyplot as plt
-import numpy as np
 
-def create_visualizations(results, losses, output_dir="sae_analysis"):
-    """Create comprehensive visualizations."""
+
+def create_matplotlib_visualizations(results, losses, output_dir="sae_analysis"):
+    """Create matplotlib visualizations as fallback."""
     os.makedirs(output_dir, exist_ok=True)
     
-    # 1. Training loss
+    # Training loss
     plt.figure(figsize=(10, 6))
     plt.plot(losses)
     plt.xlabel('Training Step')
@@ -233,9 +332,8 @@ def create_visualizations(results, losses, output_dir="sae_analysis"):
     plt.grid(True, alpha=0.3)
     plt.savefig(f"{output_dir}/training_loss.png", dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {output_dir}/training_loss.png")
     
-    # 2. Feature activation heatmaps
+    # Feature heatmaps
     n_plots = len(results)
     fig, axes = plt.subplots(n_plots, 1, figsize=(12, 3*n_plots))
     if n_plots == 1:
@@ -246,21 +344,17 @@ def create_visualizations(results, losses, output_dir="sae_analysis"):
         im = ax.imshow(features.T, aspect='auto', cmap='viridis', interpolation='nearest')
         ax.set_xlabel('Token Position')
         ax.set_ylabel('SAE Feature')
-        ax.set_title(f"{result['smiles']} | L0={result['l0']:.1f} | Recon Error={result['recon_error']:.4f}")
+        ax.set_title(f"{result['smiles']} | L0={result['l0']:.1f} | Error={result['recon_error']:.4f}")
         plt.colorbar(im, ax=ax, fraction=0.046)
-        
-        # Token labels
         ax.set_xticks(range(len(result['tokens'])))
         ax.set_xticklabels(result['tokens'], rotation=45, ha='right')
     
     plt.tight_layout()
     plt.savefig(f"{output_dir}/feature_heatmap.png", dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {output_dir}/feature_heatmap.png")
     
-    # 3. Sparsity metrics
+    # Metrics
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
     smiles_labels = [r["smiles"] for r in results]
     l0_values = [r["l0"] for r in results]
     errors = [r["recon_error"] for r in results]
@@ -282,48 +376,10 @@ def create_visualizations(results, losses, output_dir="sae_analysis"):
     plt.tight_layout()
     plt.savefig(f"{output_dir}/metrics.png", dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {output_dir}/metrics.png")
     
-    # 4. Feature sparsity distribution
-    all_features = torch.cat([r["features"] for r in results], dim=0)
-    feature_usage = (all_features.abs() > 1e-5).float().mean(dim=0).numpy()
-    
-    plt.figure(figsize=(10, 6))
-    plt.hist(feature_usage, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
-    plt.xlabel('Activation Frequency')
-    plt.ylabel('Number of Features')
-    plt.title('SAE Feature Sparsity Distribution')
-    plt.axvline(feature_usage.mean(), color='red', linestyle='--', linewidth=2,
-                label=f'Mean: {feature_usage.mean():.3f}')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(f"{output_dir}/feature_sparsity.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {output_dir}/feature_sparsity.png")
-    
-    # 5. Top active features per molecule
-    fig, axes = plt.subplots(n_plots, 1, figsize=(10, 4*n_plots))
-    if n_plots == 1:
-        axes = [axes]
-    
-    for ax, result in zip(axes, results):
-        features = result["features"].numpy()
-        feature_max = features.max(axis=0)
-        top_k = min(20, len(feature_max))
-        top_indices = np.argsort(feature_max)[-top_k:][::-1]
-        
-        ax.barh(range(top_k), feature_max[top_indices], color='steelblue', edgecolor='black')
-        ax.set_yticks(range(top_k))
-        ax.set_yticklabels([f"F{i}" for i in top_indices])
-        ax.set_xlabel('Max Activation')
-        ax.set_title(f"Top {top_k} Features: {result['smiles']}")
-        ax.invert_yaxis()
-        ax.grid(True, alpha=0.3, axis='x')
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/top_features.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {output_dir}/top_features.png")
+    print(f"✓ Saved: {output_dir}/training_loss.png")
+    print(f"✓ Saved: {output_dir}/feature_heatmap.png")
+    print(f"✓ Saved: {output_dir}/metrics.png")
 
 
 # -----------------------------
@@ -383,18 +439,34 @@ def main():
     for r in results:
         print(f"{r['smiles']:15s} | L0: {r['l0']:6.2f} | Recon Error: {r['recon_error']:.4f}")
     
-    # Create visualizations
-    print("\n=== Creating Visualizations ===")
-    create_visualizations(results, losses)
+    # Try to generate interactive dashboard
+    print("\n=== Attempting Dashboard Generation ===")
+    try:
+        # Wrap model for transformer_lens compatibility
+        hooked_model = wrap_gpt2_for_dashboard(model, tokenizer)
+        
+        # Create token dataset
+        tokens = create_token_dataset(smiles, tokenizer, max_samples=100)
+        tokens = tokens.to(device)
+        
+        # Generate dashboard
+        vis_data = generate_sae_dashboard(sae, hooked_model, tokens)
+        
+    except Exception as e:
+        print(f"Dashboard generation failed: {e}")
+        print("Using matplotlib fallback...")
+    
+    # Always create matplotlib visualizations
+    print("\n=== Creating Matplotlib Visualizations ===")
+    create_matplotlib_visualizations(results, losses)
     
     print("\n=== Complete! ===")
-    print("All results saved in 'sae_analysis/' directory")
+    print("Results saved in 'sae_analysis/' directory")
     print("\nGenerated files:")
+    print("  - feature_dashboard.html (if sae_dashboard available)")
     print("  - training_loss.png")
     print("  - feature_heatmap.png")
     print("  - metrics.png")
-    print("  - feature_sparsity.png")
-    print("  - top_features.png")
 
 
 if __name__ == "__main__":
