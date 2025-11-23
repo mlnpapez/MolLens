@@ -6,9 +6,6 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 import re
 from typing import List
-from sae_lens import SAE
-from transformer_lens import HookedTransformer
-import matplotlib.pyplot as plt
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -107,41 +104,140 @@ def train_gpt(model, dataloader, epochs=1, lr=5e-4, device="cuda"):
 
 
 # -----------------------------
-# 3) Collect Activations
+# 3) Create Tokenizer Wrapper for Dashboard
 # -----------------------------
-def collect_activations(model, dataloader, layer_idx=0, max_batches=50, device="cuda"):
-    """Collect hidden state activations from a specific layer."""
+class TokenizerWrapper:
+    """Wrapper to make SmilesTokenizer compatible with HuggingFace tokenizer interface."""
+    def __init__(self, smiles_tokenizer):
+        self.smiles_tok = smiles_tokenizer
+        self.vocab_size = smiles_tokenizer.vocab_size
+        self.pad_token_id = smiles_tokenizer.pad_token_id
+        self.bos_token_id = smiles_tokenizer.bos_token_id
+        self.eos_token_id = smiles_tokenizer.eos_token_id
+        
+        # Additional attributes needed by transformer_lens
+        self.padding_side = "right"
+        self.pad_token = PAD
+        self.bos_token = BOS
+        self.eos_token = EOS
+        self.unk_token = UNK
+        self.model_max_length = 1024
+        
+        # vocab attribute needed by sae_dashboard - map token string to ID
+        self.vocab = smiles_tokenizer.c2i
+    
+    def encode(self, text, **kwargs):
+        """Encode text to token IDs."""
+        if isinstance(text, list):
+            # Batch encoding
+            return [self.smiles_tok.encode(t) for t in text]
+        return self.smiles_tok.encode(text)
+    
+    def decode(self, token_ids, **kwargs):
+        """Decode token IDs to text."""
+        skip_special = kwargs.get('skip_special_tokens', True)
+        if isinstance(token_ids, list) and isinstance(token_ids[0], list):
+            # Batch decoding
+            return [self.smiles_tok.decode(ids, skip_special_tokens=skip_special) for ids in token_ids]
+        return self.smiles_tok.decode(token_ids, skip_special_tokens=skip_special)
+    
+    def batch_decode(self, token_ids, **kwargs):
+        """Batch decode token IDs."""
+        skip_special = kwargs.get('skip_special_tokens', True)
+        return [self.smiles_tok.decode(ids, skip_special_tokens=skip_special) for ids in token_ids]
+    
+    def convert_ids_to_tokens(self, token_ids):
+        """Convert token IDs to token strings."""
+        if isinstance(token_ids, int):
+            return self.smiles_tok.i2c.get(token_ids, UNK)
+        return [self.smiles_tok.i2c.get(i, UNK) for i in token_ids]
+    
+    def convert_tokens_to_string(self, tokens):
+        """Convert tokens to string."""
+        return "".join(tokens)
+    
+    def __call__(self, text, **kwargs):
+        """Make tokenizer callable like HF tokenizers."""
+        return {"input_ids": self.encode(text, **kwargs)}
+
+def create_hf_tokenizer_wrapper(smiles_tokenizer):
+    """Create a HuggingFace-compatible tokenizer wrapper."""
+    return TokenizerWrapper(smiles_tokenizer)
+
+
+# -----------------------------
+# 4) Convert to HookedTransformer for Dashboard
+# -----------------------------
+from transformer_lens import HookedTransformer, HookedTransformerConfig
+
+def convert_to_hooked_transformer(gpt2_model, tokenizer, device="cuda"):
+    """
+    Create a HookedTransformer with custom config matching our GPT2 model.
+    """
+    cfg = HookedTransformerConfig(
+        n_layers=gpt2_model.config.n_layer,
+        d_model=gpt2_model.config.n_embd,
+        n_ctx=gpt2_model.config.n_positions if hasattr(gpt2_model.config, 'n_positions') else 1024,
+        d_head=gpt2_model.config.n_embd // gpt2_model.config.n_head,
+        n_heads=gpt2_model.config.n_head,
+        d_vocab=gpt2_model.config.vocab_size,
+        act_fn="gelu",
+        d_mlp=gpt2_model.config.n_embd * 4,
+        normalization_type="LN",
+        device=device,
+    )
+    
+    # Create HookedTransformer from config
+    hooked_model = HookedTransformer(cfg, move_to_device=True)
+    
+    # Copy weights from trained GPT2 model
+    print("Copying weights to HookedTransformer...")
+    hooked_model.load_state_dict(gpt2_model.state_dict(), strict=False)
+    
+    # Attach tokenizer - CRITICAL for dashboard
+    hooked_model.tokenizer = create_hf_tokenizer_wrapper(tokenizer)
+    
+    return hooked_model
+
+
+# -----------------------------
+# 5) Collect Activations from HookedTransformer
+# -----------------------------
+def collect_hooked_activations(model, dataloader, hook_point="blocks.0.hook_resid_post", 
+                               max_batches=50, device="cuda"):
+    """Collect activations from HookedTransformer at specific hook point."""
     model.eval()
     activations = []
     
     with torch.no_grad():
-        for i, x in enumerate(tqdm(dataloader, desc="Collecting activations")):
+        for i, x in enumerate(tqdm(dataloader, desc=f"Collecting from {hook_point}")):
             if i >= max_batches:
                 break
             
             x = x.to(device)
-            outputs = model(input_ids=x, output_hidden_states=True)
-            hidden = outputs.hidden_states[layer_idx + 1]  # +1 because index 0 is embeddings
-            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
-            activations.append(hidden_flat.cpu())
+            _, cache = model.run_with_cache(x)
+            
+            # Get activations from the specified hook
+            acts = cache[hook_point]  # shape: [batch, seq, d_model]
+            acts_flat = acts.reshape(-1, acts.shape[-1])
+            activations.append(acts_flat.cpu())
     
     all_activations = torch.cat(activations, dim=0)
-    print(f"Collected {all_activations.shape[0]} activation vectors")
+    print(f"Collected {all_activations.shape[0]} activations of dim {all_activations.shape[1]}")
     return all_activations
 
 
 # -----------------------------
-# 4) Train SAE - Correct sae_lens imports
+# 6) Train SAE
 # -----------------------------
-
+from sae_lens import SAE
 
 def train_sae_simple(activations, d_in, d_sae=None, l1_coeff=1e-3, 
                      lr=3e-4, steps=3000, batch_size=1024, device="cuda"):
-    """Train SAE using sae_lens SAE class."""
+    """Train SAE using sae_lens."""
     if d_sae is None:
         d_sae = d_in * 4
     
-    # Initialize SAE using from_dict (correct API)
     sae = SAE.from_dict({
         "d_in": d_in,
         "d_sae": d_sae,
@@ -158,11 +254,9 @@ def train_sae_simple(activations, d_in, d_sae=None, l1_coeff=1e-3,
         indices = torch.randint(0, activations.shape[0], (batch_size,))
         batch = activations[indices].to(device)
         
-        # Use encode/decode methods
         feature_acts = sae.encode(batch)
         reconstruction = sae.decode(feature_acts)
         
-        # Loss calculation
         recon_loss = (reconstruction - batch).pow(2).mean()
         l1_loss = l1_coeff * feature_acts.abs().sum(dim=-1).mean()
         loss = recon_loss + l1_loss
@@ -180,58 +274,10 @@ def train_sae_simple(activations, d_in, d_sae=None, l1_coeff=1e-3,
 
 
 # -----------------------------
-# 5) Wrap model for sae_dashboard compatibility
+# 7) Generate SAE Dashboard
 # -----------------------------
-
-
-def wrap_gpt2_for_dashboard(gpt2_model, tokenizer):
-    """
-    Wrap HuggingFace GPT2 model to work with transformer_lens.
-    This allows compatibility with sae_dashboard.
-    """
-    # Create HookedTransformer from pretrained
-    hooked_model = HookedTransformer.from_pretrained(
-        "gpt2-small",
-        device=str(gpt2_model.device)
-    )
-    
-    # Copy weights from our trained model
-    hooked_model.load_state_dict(gpt2_model.state_dict(), strict=False)
-    
-    return hooked_model
-
-
-# -----------------------------
-# 6) Create tokens dataset for dashboard
-# -----------------------------
-def create_token_dataset(smiles_list, tokenizer, max_samples=100):
-    """Create a token dataset for sae_dashboard."""
-    tokens_list = []
-    
-    for smiles in smiles_list[:max_samples]:
-        token_ids = tokenizer.encode(smiles)
-        tokens_list.append(torch.tensor(token_ids))
-    
-    # Pad to same length
-    max_len = max(len(t) for t in tokens_list)
-    padded_tokens = []
-    for t in tokens_list:
-        if len(t) < max_len:
-            padded = torch.cat([t, torch.full((max_len - len(t),), tokenizer.pad_token_id)])
-        else:
-            padded = t
-        padded_tokens.append(padded)
-    
-    return torch.stack(padded_tokens)
-
-
-# -----------------------------
-# 7) Generate SAE Dashboard Visualization
-# -----------------------------
-def generate_sae_dashboard(sae, model, tokens, output_dir="sae_analysis"):
-    """
-    Generate interactive SAE dashboard using sae_dashboard.
-    """
+def generate_sae_dashboard(sae, hooked_model, tokens, hook_point, device, output_dir="sae_analysis"):
+    """Generate interactive SAE dashboard."""
     try:
         from sae_dashboard.sae_vis_data import SaeVisConfig
         from sae_dashboard.sae_vis_runner import SaeVisRunner
@@ -243,39 +289,42 @@ def generate_sae_dashboard(sae, model, tokens, output_dir="sae_analysis"):
         
         # Configure visualization
         config = SaeVisConfig(
-            hook_point=sae.cfg.hook_name if hasattr(sae.cfg, 'hook_name') else "blocks.0.hook_resid_post",
-            features=list(range(min(50, sae.cfg.d_sae))),  # Visualize first 50 features
-            minibatch_size_features=32,
-            minibatch_size_tokens=128,
-            device=str(model.device),
+            hook_point=hook_point,
+            features=list(range(min(50, sae.cfg.d_sae))),
+            minibatch_size_features=16,
+            minibatch_size_tokens=64,
+            device=device,
             verbose=True,
         )
         
-        # Generate visualization data
-        print("Running SaeVisRunner...")
+        print("Running SaeVisRunner (this may take a few minutes)...")
         runner = SaeVisRunner(config)
         vis_data = runner.run(
             encoder=sae,
-            model=model,
-            tokens=tokens
+            model=hooked_model,
+            tokens=tokens[:100]  # Use subset for speed
         )
         
-        # Save interactive HTML dashboard
+        # Save dashboard
         dashboard_path = os.path.join(output_dir, "feature_dashboard.html")
         save_feature_centric_vis(
             sae_vis_data=vis_data,
             filename=dashboard_path
         )
         
-        print(f"\n✓ Interactive dashboard saved to: {dashboard_path}")
-        print(f"  Open this file in a web browser to explore features!")
+        print(f"\n✅ SUCCESS! Interactive dashboard saved to: {dashboard_path}")
+        print(f"   Open this file in a web browser to explore SAE features!")
         
         return vis_data
         
     except ImportError as e:
         print(f"\n⚠ sae_dashboard not installed: {e}")
         print("Install with: pip install sae-dashboard")
-        print("Falling back to matplotlib visualizations...")
+        return None
+    except Exception as e:
+        print(f"\n❌ Dashboard generation error: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -293,8 +342,9 @@ def analyze_sae_features(model, sae, tokenizer, test_smiles_list, device="cuda")
             token_ids = tokenizer.encode(smiles)
             input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
             
-            outputs = model(input_ids, output_hidden_states=True)
-            hidden = outputs.hidden_states[1]  # Layer 0
+            # Use HookedTransformer's run_with_cache
+            _, cache = model.run_with_cache(input_ids)
+            hidden = cache["blocks.0.hook_resid_post"]
             
             hidden_flat = hidden.reshape(-1, hidden.shape[-1])
             feature_acts = sae.encode(hidden_flat)
@@ -315,12 +365,13 @@ def analyze_sae_features(model, sae, tokenizer, test_smiles_list, device="cuda")
 
 
 # -----------------------------
-# 9) Fallback Matplotlib Visualizations
+# 9) Matplotlib Visualizations
 # -----------------------------
-
+import matplotlib.pyplot as plt
+import numpy as np
 
 def create_matplotlib_visualizations(results, losses, output_dir="sae_analysis"):
-    """Create matplotlib visualizations as fallback."""
+    """Create matplotlib visualizations."""
     os.makedirs(output_dir, exist_ok=True)
     
     # Training loss
@@ -413,9 +464,16 @@ def main():
     model = GPT2LMHeadModel(config)
     model = train_gpt(model, dataloader, epochs=2, device=device)
     
-    # Collect activations
+    # Convert to HookedTransformer for dashboard compatibility
+    print("\n=== Converting to HookedTransformer ===")
+    hooked_model = convert_to_hooked_transformer(model, tokenizer, device)
+    
+    # Collect activations from HookedTransformer
     print("\n=== Collecting Activations ===")
-    activations = collect_activations(model, dataloader, layer_idx=0, max_batches=50, device=device)
+    hook_point = "blocks.0.hook_resid_post"  # Layer 0 residual stream
+    activations = collect_hooked_activations(
+        hooked_model, dataloader, hook_point=hook_point, max_batches=50, device=device
+    )
     
     # Train SAE
     print("\n=== Training SAE ===")
@@ -429,44 +487,48 @@ def main():
         device=device
     )
     
+    # Prepare tokens for dashboard
+    print("\n=== Preparing Token Dataset ===")
+    token_dataset = []
+    for s in smiles[:200]:
+        token_dataset.append(torch.tensor(tokenizer.encode(s)))
+    # Pad to same length
+    max_len = max(len(t) for t in token_dataset)
+    padded = []
+    for t in token_dataset:
+        if len(t) < max_len:
+            padded.append(torch.cat([t, torch.full((max_len - len(t),), tokenizer.pad_token_id)]))
+        else:
+            padded.append(t)
+    tokens = torch.stack(padded).to(device)
+    
+    # Generate dashboard
+    print("\n=== Generating SAE Dashboard ===")
+    vis_data = generate_sae_dashboard(sae, hooked_model, tokens, hook_point, device)
+    
     # Analyze features
     print("\n=== Analyzing SAE Features ===")
     test_smiles = ["CCO", "CC(C)O", "c1ccccc1", "CC(=O)O", "CCN"]
-    results = analyze_sae_features(model, sae, tokenizer, test_smiles, device)
+    results = analyze_sae_features(hooked_model, sae, tokenizer, test_smiles, device)
     
     # Print summary
     print("\n=== Analysis Summary ===")
     for r in results:
         print(f"{r['smiles']:15s} | L0: {r['l0']:6.2f} | Recon Error: {r['recon_error']:.4f}")
     
-    # Try to generate interactive dashboard
-    print("\n=== Attempting Dashboard Generation ===")
-    try:
-        # Wrap model for transformer_lens compatibility
-        hooked_model = wrap_gpt2_for_dashboard(model, tokenizer)
-        
-        # Create token dataset
-        tokens = create_token_dataset(smiles, tokenizer, max_samples=100)
-        tokens = tokens.to(device)
-        
-        # Generate dashboard
-        vis_data = generate_sae_dashboard(sae, hooked_model, tokens)
-        
-    except Exception as e:
-        print(f"Dashboard generation failed: {e}")
-        print("Using matplotlib fallback...")
-    
-    # Always create matplotlib visualizations
+    # Create matplotlib visualizations
     print("\n=== Creating Matplotlib Visualizations ===")
     create_matplotlib_visualizations(results, losses)
     
-    print("\n=== Complete! ===")
-    print("Results saved in 'sae_analysis/' directory")
-    print("\nGenerated files:")
-    print("  - feature_dashboard.html (if sae_dashboard available)")
-    print("  - training_loss.png")
-    print("  - feature_heatmap.png")
-    print("  - metrics.png")
+    print("\n" + "="*60)
+    print("=== COMPLETE! ===")
+    print("="*60)
+    print("\nGenerated files in 'sae_analysis/':")
+    print("  📊 feature_dashboard.html - Interactive SAE dashboard (open in browser!)")
+    print("  📈 training_loss.png")
+    print("  🔥 feature_heatmap.png")
+    print("  📉 metrics.png")
+    print("\n💡 TIP: Open feature_dashboard.html in your browser for interactive exploration!")
 
 
 if __name__ == "__main__":
