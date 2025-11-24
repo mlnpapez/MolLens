@@ -424,10 +424,10 @@ def plot_training_curves(
 def plot_feature_heatmaps(results: List[FeatureAnalysis], output_dir: str) -> None:
     """Plot feature activation heatmaps per molecule."""
     n = len(results)
-    fig, axes = plt.subplots(n, 1, figsize=(12, 3*n))
+    fig, axes = plt.subplots(1, n, figsize=(5*n, 15))
     if n == 1:
         axes = [axes]
-    
+
     for ax, result in zip(axes, results):
         features = result.features.numpy()
         im = ax.imshow(features.T, aspect='auto', cmap='viridis', interpolation='nearest')
@@ -580,7 +580,7 @@ def plot_feature_correlation(results: List[FeatureAnalysis], output_dir: str) ->
 
 def plot_token_attribution(results: List[FeatureAnalysis], output_dir: str) -> None:
     """Plot token-level feature attribution heatmap."""
-    n = min(3, len(results))  # Show first 3 molecules
+    n = len(results)
     fig, axes = plt.subplots(n, 1, figsize=(14, 4*n))
     if n == 1:
         axes = [axes]
@@ -637,14 +637,14 @@ def main():
     config = GPT2Config(
         n_layer=4,
         n_head=4,
-        n_embd=64,
+        n_embd=128,
         vocab_size=tokenizer.vocab_size,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )
     model = GPT2LMHeadModel(config)
-    model = train_gpt(model, dataloader, epochs=50, device=device)
+    model = train_gpt(model, dataloader, epochs=20, device=device)
     
     # Convert to HookedTransformer
     print("\n=== Converting to HookedTransformer ===")
@@ -663,7 +663,7 @@ def main():
         d_sae=config.n_embd * 4,
         l1_coeff=1e-1,
         lr=3e-4,
-        steps=70000,
+        steps=240000,
         device=device
     )
     
