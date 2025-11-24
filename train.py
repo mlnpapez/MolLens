@@ -210,23 +210,18 @@ def collect_activations(
     model: HookedTransformer,
     dataloader: DataLoader,
     hook_point: str = "blocks.0.hook_resid_post",
-    max_batches: int = 50,
     device: str = "cuda"
 ) -> torch.Tensor:
     """Collect activations from specific hook point."""
     model.eval()
     activations = []
-    
+
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(dataloader, desc=f"Collecting {hook_point}")):
-            if i >= max_batches:
-                break
-            
-            batch = batch.to(device)
-            _, cache = model.run_with_cache(batch)
+        for batch in tqdm(dataloader, desc=f"Collecting {hook_point}"):
+            _, cache = model.run_with_cache(batch.to(device))
             acts = cache[hook_point]  # [batch, seq, d_model]
             activations.append(acts.reshape(-1, acts.shape[-1]).cpu())
-    
+
     all_acts = torch.cat(activations, dim=0)
     print(f"Collected {all_acts.shape[0]} activations of dim {all_acts.shape[1]}")
     return all_acts
@@ -264,28 +259,33 @@ def train_sae(
     recon_losses = []
     l1_losses = []
     
-    for step in tqdm(range(steps), desc="Training SAE"):
+    pbar = tqdm(range(steps), desc="Training SAE")
+    for _ in pbar:
         indices = torch.randint(0, activations.shape[0], (batch_size,))
         batch = activations[indices].to(device)
-        
+
         feature_acts = sae.encode(batch)
         reconstruction = sae.decode(feature_acts)
-        
+
         recon_loss = (reconstruction - batch).pow(2).mean()
         l1_loss = l1_coeff * feature_acts.abs().sum(dim=-1).mean()
         loss = recon_loss + l1_loss
-        
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+
         losses.append(loss.item())
         recon_losses.append(recon_loss.item())
         l1_losses.append(l1_loss.item())
-        
-        if step % 500 == 0:
-            print(f"Step {step}: Loss={loss.item():.4f}, Recon={recon_loss.item():.4f}, L1={l1_loss.item():.4f}")
-    
+
+        # Update tqdm bar with current losses
+        pbar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            recon=f"{recon_loss.item():.4f}",
+            l1=f"{l1_loss.item():.4f}",
+        )
+
     return sae, losses, recon_losses, l1_losses
 
 
@@ -584,7 +584,7 @@ def plot_token_attribution(results: List[FeatureAnalysis], output_dir: str) -> N
     fig, axes = plt.subplots(n, 1, figsize=(14, 4*n))
     if n == 1:
         axes = [axes]
-    
+
     for ax, result in zip(axes, results[:n]):
         features = result.features.numpy()
         
@@ -592,21 +592,21 @@ def plot_token_attribution(results: List[FeatureAnalysis], output_dir: str) -> N
         max_acts = features.max(axis=0)
         top_k = min(20, features.shape[1])
         top_indices = np.argsort(max_acts)[-top_k:]
-        
+
         # Plot heatmap
         im = ax.imshow(features[:, top_indices].T, aspect='auto', cmap='YlOrRd', interpolation='nearest')
         ax.set_xlabel('Token Position', fontsize=10)
         ax.set_ylabel('Feature Index', fontsize=10)
         ax.set_title(f"Token Attribution: {result.smiles}", fontsize=11)
-        
+
         cbar = plt.colorbar(im, ax=ax)
         cbar.set_label('Activation', fontsize=9)
-        
+
         ax.set_xticks(range(len(result.tokens)))
         ax.set_xticklabels(result.tokens, rotation=45, ha='right', fontsize=9)
         ax.set_yticks(range(top_k))
         ax.set_yticklabels([f"F{top_indices[i]}" for i in range(top_k)], fontsize=8)
-    
+
     plt.tight_layout()
     plt.savefig(f"{output_dir}/token_attribution.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -653,7 +653,12 @@ def main():
     # Collect activations
     print("\n=== Collecting Activations ===")
     hook_point = "blocks.0.hook_resid_post"
-    activations = collect_activations(hooked_model, dataloader, hook_point, max_batches=50, device=device)
+    activations = collect_activations(
+        hooked_model,
+        dataloader,
+        hook_point,
+        device=device
+    )
     
     # Train SAE
     print("\n=== Training SAE ===")
@@ -661,9 +666,9 @@ def main():
         activations,
         d_in=config.n_embd,
         d_sae=config.n_embd * 4,
-        l1_coeff=1e-1,
+        l1_coeff=7e-2,
         lr=3e-4,
-        steps=240000,
+        steps=120000,
         device=device
     )
     
