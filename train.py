@@ -1,4 +1,5 @@
 import os
+import warnings
 import torch
 import pandas as pd
 import numpy as np
@@ -25,7 +26,14 @@ sns.set_style("whitegrid")
 # Model Training
 # ============================================================================
 
-def train_gpt(model: GPT2LMHeadModel, dataset: Dataset, epochs: int, lr: float, device: str) -> GPT2LMHeadModel:
+def train_gpt(
+    model: GPT2LMHeadModel,
+    dataset: Dataset,
+    epochs: int,
+    lr: float,
+    device: str,
+    pad_token_id: int = None
+) -> GPT2LMHeadModel:
     """Train GPT model using HuggingFace Trainer."""
     training_args = TrainingArguments(
         # output_dir="./gpt_checkpoints",
@@ -39,8 +47,12 @@ def train_gpt(model: GPT2LMHeadModel, dataset: Dataset, epochs: int, lr: float, 
     )
 
     def data_collator(examples):
-        batch = torch.stack(examples)
-        return {"input_ids": batch, "labels": batch}
+        batch = torch.stack(examples)  # shape: (B, seq_len)
+        if pad_token_id is not None:
+            attention_mask = (batch != pad_token_id).long()
+        else:
+            attention_mask = torch.ones_like(batch, dtype=torch.long)
+        return {"input_ids": batch, "labels": batch, "attention_mask": attention_mask}
 
     trainer = Trainer(
         model=model,
@@ -52,7 +64,10 @@ def train_gpt(model: GPT2LMHeadModel, dataset: Dataset, epochs: int, lr: float, 
     return model
 
 
-def convert_to_hooked(gpt2_model: GPT2LMHeadModel, tokenizer: SmilesTokenizer) -> HookedTransformer:
+def convert_to_hooked(
+    gpt2_model: GPT2LMHeadModel,
+    tokenizer: SmilesTokenizer
+) -> HookedTransformer:
     """Convert GPT2 to HookedTransformer."""
     cfg = HookedTransformerConfig(
         n_layers=gpt2_model.config.n_layer,
@@ -76,7 +91,11 @@ def convert_to_hooked(gpt2_model: GPT2LMHeadModel, tokenizer: SmilesTokenizer) -
 # Activation Collection
 # ============================================================================
 
-def collect_activations(model: HookedTransformer, dataloader: DataLoader, hook_point: str) -> torch.Tensor:
+def collect_activations(
+    model: HookedTransformer,
+    dataloader: DataLoader,
+    hook_point: str
+) -> torch.Tensor:
     """Collect activations from hook point."""
     model.eval()
     activations = []
@@ -158,34 +177,37 @@ def train_sae(
 
 @dataclass
 class FeatureAnalysis:
-    """Comprehensive SAE feature analysis results."""
+    """SAE feature analysis results."""
     smiles: str
     tokens: List[str]
     features: torch.Tensor
-    
+
     # Reconstruction metrics
     recon_error: float
     explained_variance: float
-    
+
     # Sparsity metrics
     l0: float
     l1: float
     dead_features: int
-    
+
     # Feature importance
     max_activating_features: List[tuple[int, float]]
     feature_entropy: float
-    
+
     # Token-level metrics
     token_variance: np.ndarray
     max_token_activation: float
 
 
-def compute_feature_metrics(features: torch.Tensor, reconstruction: torch.Tensor, 
-                           original: torch.Tensor) -> dict:
-    """Compute comprehensive feature metrics."""
+def compute_feature_metrics(
+    features: torch.Tensor,
+    reconstruction: torch.Tensor, 
+    original: torch.Tensor
+) -> dict:
+    """Compute feature metrics."""
     active_mask = features.abs() > 1e-5
-    
+
     return {
         'recon_error': (original - reconstruction).pow(2).mean().item(),
         'explained_variance': 1 - ((original - reconstruction).var() / original.var()).item(),
@@ -198,31 +220,36 @@ def compute_feature_metrics(features: torch.Tensor, reconstruction: torch.Tensor
     }
 
 
-def analyze_features(model: HookedTransformer, sae: SAE, tokenizer: SmilesTokenizer,
-                    test_smiles: List[str], hook_point: str) -> List[FeatureAnalysis]:
+def analyze_features(
+    model: HookedTransformer,
+    sae: SAE,
+    tokenizer: SmilesTokenizer,
+    test_smiles: List[str],
+    hook_point: str
+) -> List[FeatureAnalysis]:
     """Analyze SAE features on test molecules."""
     model.eval()
     sae.eval()
     results = []
-    
+
     with torch.no_grad():
         for smiles in test_smiles:
             token_ids = tokenizer.encode(smiles)
             input_ids = torch.tensor([token_ids], dtype=torch.long, device=model.cfg.device)
-            
+
             _, cache = model.run_with_cache(input_ids)
             hidden = cache[hook_point].reshape(-1, cache[hook_point].shape[-1])
-            
+
             features = sae.encode(hidden)
             reconstruction = sae.decode(features)
-            
+
             metrics = compute_feature_metrics(features, reconstruction, hidden)
-            
+
             # Top features
             max_acts = features.max(dim=0).values
             top_indices = torch.argsort(max_acts, descending=True)[:10]
             top_features = [(idx.item(), max_acts[idx].item()) for idx in top_indices]
-            
+
             results.append(FeatureAnalysis(
                 smiles=smiles,
                 tokens=[tokenizer.i2c[i] for i in token_ids],
@@ -237,7 +264,7 @@ def analyze_features(model: HookedTransformer, sae: SAE, tokenizer: SmilesTokeni
                 token_variance=metrics['token_variance'],
                 max_token_activation=metrics['max_token_activation'],
             ))
-    
+
     return results
 
 
@@ -245,12 +272,16 @@ def analyze_features(model: HookedTransformer, sae: SAE, tokenizer: SmilesTokeni
 # Visualization
 # ============================================================================
 
-def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) -> None:
+def create_plots(
+    results: List[FeatureAnalysis],
+    losses: dict,
+    output_dir: str
+) -> None:
     """Generate all analysis plots."""
     os.makedirs(output_dir, exist_ok=True)
     smiles = [r.smiles for r in results]
     n = len(results)
-    
+
     # 1. Training Curves
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.plot(losses['total'], linewidth=2, color='steelblue')
@@ -258,7 +289,7 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     ax1.set_ylabel('Total Loss')
     ax1.set_title('SAE Training Loss')
     ax1.grid(True, alpha=0.3)
-    
+
     ax2.plot(losses['recon'], label='Reconstruction', linewidth=2, color='coral')
     ax2.plot(losses['l1'], label='L1 Sparsity', linewidth=2, color='mediumseagreen')
     ax2.set_xlabel('Training Step')
@@ -266,16 +297,16 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     ax2.set_title('Loss Components')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(f"{output_dir}/training_curves.png", dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     # 2. Feature Heatmaps
     fig, axes = plt.subplots(1, n, figsize=(5*n, 15))
     if n == 1:
         axes = [axes]
-    
+
     for ax, r in zip(axes, results):
         im = ax.imshow(r.features.numpy().T, aspect='auto', cmap='viridis')
         ax.set_xlabel('Token Position', fontsize=10)
@@ -285,14 +316,14 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
         ax.set_xticklabels(r.tokens, rotation=45, ha='right', fontsize=8)
         cbar = plt.colorbar(im, ax=ax, fraction=0.046)
         cbar.set_label('Activation', fontsize=9)
-    
+
     plt.tight_layout()
     plt.savefig(f"{output_dir}/feature_heatmaps.png", dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     # 3. Sparsity Metrics
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
+
     bars1 = ax1.bar(range(n), [r.l0 for r in results], color='steelblue', edgecolor='black', linewidth=1.5)
     ax1.set_xticks(range(n))
     ax1.set_xticklabels(smiles, rotation=45, ha='right')
@@ -316,12 +347,12 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     plt.tight_layout()
     plt.savefig(f"{output_dir}/sparsity_metrics.png", dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     # 4. Feature Distribution
     all_features = torch.cat([r.features for r in results], dim=0).numpy()
-    
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
+
     activations = all_features[all_features > 1e-5]
     ax1.hist(activations.flatten(), bins=100, edgecolor='black', alpha=0.7, color='steelblue')
     ax1.set_xlabel('Activation Magnitude')
@@ -329,7 +360,7 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     ax1.set_title('Distribution of Non-Zero Activations')
     ax1.set_yscale('log')
     ax1.grid(True, alpha=0.3)
-    
+
     feature_usage = (all_features > 1e-5).mean(axis=0)
     ax2.hist(feature_usage, bins=50, edgecolor='black', alpha=0.7, color='mediumseagreen')
     ax2.axvline(feature_usage.mean(), color='red', linestyle='--', linewidth=2,
@@ -339,16 +370,16 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     ax2.set_title('Feature Sparsity Distribution')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(f"{output_dir}/feature_distribution.png", dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     # 5. Top Features
     fig, axes = plt.subplots(n, 1, figsize=(10, 4*n))
     if n == 1:
         axes = [axes]
-    
+
     for ax, r in zip(axes, results):
         features, activations = zip(*r.max_activating_features)
         y_pos = np.arange(len(features))
@@ -362,17 +393,17 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
         for bar, val in zip(bars, activations):
             ax.text(bar.get_width(), bar.get_y() + bar.get_height()/2.,
                    f'{val:.2f}', ha='left', va='center', fontsize=9)
-    
+
     plt.tight_layout()
     plt.savefig(f"{output_dir}/top_features.png", dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     # 6. Feature Correlation
     active = (all_features > 1e-5).astype(float)
     feature_activity = active.sum(axis=0)
     top_features_idx = np.argsort(feature_activity)[-50:]
     corr = np.corrcoef(active[:, top_features_idx].T)
-    
+
     plt.figure(figsize=(12, 10))
     sns.heatmap(corr, cmap='coolwarm', center=0, vmin=-1, vmax=1,
                 square=True, linewidths=0.5, cbar_kws={"shrink": 0.8})
@@ -382,18 +413,18 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     plt.tight_layout()
     plt.savefig(f"{output_dir}/feature_correlation.png", dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     # 7. Token Attribution
     fig, axes = plt.subplots(n, 1, figsize=(14, 4*n))
     if n == 1:
         axes = [axes]
-    
+
     for ax, r in zip(axes, results):
         features = r.features.numpy()
         max_acts = features.max(axis=0)
         top_k = min(20, features.shape[1])
         top_indices = np.argsort(max_acts)[-top_k:]
-        
+
         im = ax.imshow(features[:, top_indices].T, aspect='auto', cmap='YlOrRd')
         ax.set_xlabel('Token Position', fontsize=10)
         ax.set_ylabel('Feature Index', fontsize=10)
@@ -404,14 +435,14 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
         ax.set_yticklabels([f"F{top_indices[i]}" for i in range(top_k)], fontsize=8)
         cbar = plt.colorbar(im, ax=ax)
         cbar.set_label('Activation', fontsize=9)
-    
+
     plt.tight_layout()
     plt.savefig(f"{output_dir}/token_attribution.png", dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     # 8. Enhanced Metrics (new plots)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
+
     # Explained variance
     axes[0, 0].bar(range(n), [r.explained_variance for r in results], color='steelblue')
     axes[0, 0].set_xticks(range(n))
@@ -420,7 +451,7 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     axes[0, 0].set_title('Explained Variance')
     axes[0, 0].axhline(0.9, color='red', linestyle='--', alpha=0.5)
     axes[0, 0].grid(True, alpha=0.3, axis='y')
-    
+
     # Dead features
     axes[0, 1].bar(range(n), [r.dead_features for r in results], color='indianred')
     axes[0, 1].set_xticks(range(n))
@@ -428,7 +459,7 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     axes[0, 1].set_ylabel('Count')
     axes[0, 1].set_title('Dead Features')
     axes[0, 1].grid(True, alpha=0.3, axis='y')
-    
+
     # Feature entropy
     axes[1, 0].bar(range(n), [r.feature_entropy for r in results], color='darkorange')
     axes[1, 0].set_xticks(range(n))
@@ -436,7 +467,7 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     axes[1, 0].set_ylabel('Entropy')
     axes[1, 0].set_title('Feature Entropy')
     axes[1, 0].grid(True, alpha=0.3, axis='y')
-    
+
     # Sparsity vs quality scatter
     l0_vals = [r.l0 for r in results]
     ev_vals = [r.explained_variance for r in results]
@@ -447,22 +478,27 @@ def create_plots(results: List[FeatureAnalysis], losses: dict, output_dir: str) 
     axes[1, 1].grid(True, alpha=0.3)
     for i, txt in enumerate(smiles):
         axes[1, 1].annotate(txt, (l0_vals[i], ev_vals[i]), fontsize=8, alpha=0.7)
-    
+
     plt.tight_layout()
     plt.savefig(f"{output_dir}/enhanced_metrics.png", dpi=150, bbox_inches='tight')
     plt.close()
 
 
-def generate_dashboard(sae: SAE, model: HookedTransformer, tokens: torch.Tensor,
-                      hook_point: str, output_dir: str) -> None:
+def generate_dashboard(
+    sae: SAE,
+    model: HookedTransformer,
+    tokens: torch.Tensor,
+    hook_point: str,
+    output_dir: str
+) -> None:
     """Generate SAE dashboard."""
     config = SaeVisConfig(
         hook_point=hook_point,
-        features=list(range(min(50, sae.cfg.d_sae))),
+        features=list(range(min(10, sae.cfg.d_sae))),
         minibatch_size_features=16,
         minibatch_size_tokens=64,
         device=str(model.cfg.device),
-        verbose=True,
+        verbose=False,
     )
 
     runner = SaeVisRunner(config)
@@ -494,19 +530,30 @@ def main():
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
+        loss_type="ForCausalLMLoss",
     )
-    model = train_gpt(GPT2LMHeadModel(config), dataset, epochs=20, lr=5e-4, device=device)
+    model = train_gpt(
+        GPT2LMHeadModel(config),
+        dataset,
+        epochs=20,
+        lr=5e-4,
+        device=device,
+        pad_token_id=tokenizer.pad_token_id
+    )
 
     hooked_model = convert_to_hooked(model, tokenizer)
     hook_point = "blocks.0.hook_resid_post"
 
-    print("\n=== Collecting Activations ===")
     activations = collect_activations(hooked_model, dataloader, hook_point)
 
-    print("\n=== Training SAE on Activations ===")
     sae, losses = train_sae(
-        activations, d_in=config.n_embd, d_sae=config.n_embd * 4,
-        l1_coeff=7e-2, lr=3e-4, steps=120000, device=device
+        activations,
+        d_in=config.n_embd,
+        d_sae=config.n_embd * 4,
+        l1_coeff=8e-2,
+        lr=3e-4,
+        steps=120000,
+        device=device
     )
 
     test_smiles = ["CCO", "CC(C)O", "c1ccccc1", "CC(=O)O", "CCN", "CCCC", "CC(C)C"]
@@ -527,7 +574,7 @@ def main():
     tokens = torch.stack([
         torch.cat([torch.tensor(tokenizer.encode(s)), 
                    torch.full((96 - len(tokenizer.encode(s)),), tokenizer.pad_token_id)])
-        for s in smiles[:200]
+        for s in smiles[200:250]
     ]).to(device)
     generate_dashboard(sae, hooked_model, tokens, hook_point, output_dir)
 
